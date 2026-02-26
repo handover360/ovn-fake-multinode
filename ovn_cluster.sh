@@ -16,7 +16,7 @@ USE_OVN_RPMS="${USE_OVN_RPMS:-no}"
 USE_OVN_DEBS="${USE_OVN_DEBS:-no}"
 EXTRA_OPTIMIZE="${EXTRA_OPTIMIZE:-no}"
 OS_BASE=${OS_BASE:-"fedora"}
-OS_IMAGE=${OS_IMAGE:-"quay.io/fedora/fedora:latest"}
+OS_IMAGE=${OS_IMAGE:-"docker.io/library/fedora:33"}
 OS_IMAGE_PULL_RETRIES=${OS_IMAGE_PULL_RETRIES:-40}
 OS_IMAGE_PULL_INTERVAL=${OS_IMAGE_PULL_INTERVAL:-5}
 USE_OVSDB_ETCD=${USE_OVSDB_ETCD:-no}
@@ -85,6 +85,28 @@ OVN_SBDB_SRC=${OVN_SBDB_SRC}
 
 OVNNBCTL_CMD="ovn-nbctl --no-leader-only"
 OVNSBCTL_CMD="ovn-sbctl --no-leader-only"
+
+function get_sb_leader() {
+    local nodes=("ovn-central-az1-1" "ovn-central-az1-2" "ovn-central-az1-3")
+    
+    for node in "${nodes[@]}"; do
+        # 해당 컨테이너가 실행 중인지 먼저 확인 (꺼져 있으면 exec에서 에러 발생 방지)
+        if ! podman ps --format '{{.Names}}' | grep -q "^${node}$"; then
+            continue
+        fi
+
+        # ovs-appctl 명령으로 리더 여부 확인
+        if podman exec "$node" ovs-appctl -t /var/run/ovn/ovnsb_db.ctl cluster/status OVN_Southbound 2>/dev/null | grep -q "Role: leader"; then
+            echo "$node"
+            return 0
+        fi
+    done
+
+    # 모든 노드에서 리더를 못 찾은 경우 (Raft 선출 중일 수 있음)
+    # 로그로 경고를 남기고 기본 노드를 반환합니다.
+    echo "Warning: SB leader not found, defaulting to ovn-central-az1-1" >&2
+    echo "ovn-central-az1-1"
+}
 
 function set_node_names() {
     if [ "x$CENTRAL_NAME" == "x" ]; then
@@ -219,6 +241,7 @@ function add-ovs-container-ports() {
     eth=eth1
 
     ip_index=0
+
     if [ "$ovn_central" == "yes" ]; then
         for i in $(seq 3); do
             echo -n > _ovn_central_$i
@@ -286,7 +309,13 @@ function add-ovs-container-ports() {
     fi
 
     for name in "${CHASSIS_NAMES[@]}"; do
-        ip=$(./ip_gen.py $ip_range/$cidr $ip_start $ip_index)
+	# [수정] 섀시 이름에서 숫자를 추출하여 고정 오프셋(예: 5)을 더해 인덱스를 만듭니다.
+	# central(3대), gw(1대) 등이 보통 4~5자리를 차지하므로 숫자에 4를 더하면 겹치지 않습니다.
+	node_num=$(echo $name | grep -oP '\d+$' || echo 0)
+	current_index=$((node_num + 3))
+
+        #ip=$(./ip_gen.py $ip_range/$cidr $ip_start $ip_index)
+        ip=$(./ip_gen.py $ip_range/$cidr $ip_start $current_index)
         ./ovs-runc add-port $br $eth ${name} --ipaddress=${ip}/${cidr}
         (( ip_index += 1))
     done
@@ -326,6 +355,24 @@ function configure-ovn() {
     ovn_remote=$2
     ovn_monitor_all=$3
     ovn_dp_type=$4
+
+    # 리더 노드를 찾음
+    local leader_node=$(get_sb_leader)
+
+    # 1. ovn_remote가 yes/no/empty일 경우 동적으로 eth1에서 주소 수집
+    if [ "$ovn_remote" == "yes" ] || [ "$ovn_remote" == "no" ] || [ -z "$ovn_remote" ]; then
+        # 리더 노드를 포함한 클러스터 IP 정보를 가져오기 위해 1, 2, 3번 순회 (이건 동일)
+        local c1=$(podman exec ovn-central-az1-1 ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        local c2=$(podman exec ovn-central-az1-2 ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        local c3=$(podman exec ovn-central-az1-3 ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+
+        # 값이 비어있을 경우를 대비한 하드코딩 백업
+        c1=${c1:-"170.168.0.2"}
+        c2=${c2:-"170.168.0.3"}
+        c3=${c3:-"170.168.0.4"}
+
+        ovn_remote="ssl:${c1}:6642,ssl:${c2}:6642,ssl:${c3}:6642"
+    fi
 
     rm -f ${FAKENODE_MNT_DIR}/configure_ovn.sh
 
@@ -540,7 +587,8 @@ function start-ovn-ic() {
         fi
     elif [ -z "$CENTRAL_IC_IP" ] || [ -z "$CENTRAL_IC_ID" ]; then
         echo "IC DBs not started locally, please specify the IC DBs container name (CENTRAL_IC_ID) and its IP (CENTRAL_IC_IP)"
-        exit 1
+        return 0 
+	# exit 1
     fi
 
     for name in "${CENTRAL_NAMES[@]}"; do
@@ -622,9 +670,9 @@ function start() {
         check-no-gw "start"
     fi
 
-    if [ "$ovn_add_chassis" == "no" ] && [ "${CHASSIS_COUNT}" -gt 0 ]; then
-        check-no-chassis "start"
-    fi
+#    if [ "$ovn_add_chassis" == "no" ] && [ "${CHASSIS_COUNT}" -gt 0 ]; then
+#        check-no-chassis "start"
+#    fi
 
     setup-ovs-in-host
 
@@ -750,6 +798,7 @@ function start() {
 }
 
 function create_fake_vms() {
+    echo "starting create_fake_vms()"	
     az=$1
     [ $2 -gt 1 ] && ic="yes" || ic="no"
     cat << EOF > ${FAKENODE_MNT_DIR}/create_ovn_res.sh
@@ -846,16 +895,18 @@ EOF
     chmod 0755 ${FAKENODE_MNT_DIR}/create_ovn_res.sh
 
     # add ts transit switch.
-    ${RUNC_CMD} exec ${CENTRAL_IC_ID} ovn-ic-nbctl --may-exist ts-add ts1
+    # ${RUNC_CMD} exec ${CENTRAL_IC_ID} ovn-ic-nbctl --may-exist ts-add ts1
     # wait for ovn-ic to kick in
-    while sleep 2; do
-        ${RUNC_CMD} exec ${CENTRAL_IC_ID} ${OVNNBCTL_CMD} ls-list | grep -q ts1 && break
-    done
+    #while sleep 2; do
+    #    ${RUNC_CMD} exec ${CENTRAL_IC_ID} ${OVNNBCTL_CMD} ls-list | grep -q ts1 && break
+    #done
 
     if [ "$OVN_DB_CLUSTER" = "yes" ]; then
-        ${RUNC_CMD} exec ${CENTRAL_PREFIX}${az}-1 bash /data/create_ovn_res.sh $az $ic
+        #${RUNC_CMD} exec ${CENTRAL_PREFIX}${az}-1 bash /data/create_ovn_res.sh $az $ic
+        ${RUNC_CMD} exec ${CENTRAL_PREFIX}${az}-1 bash /data/create_ovn_res.sh $az no
     else
-        ${RUNC_CMD} exec ${CENTRAL_PREFIX}${az} bash /data/create_ovn_res.sh $az $ic
+        #${RUNC_CMD} exec ${CENTRAL_PREFIX}${az} bash /data/create_ovn_res.sh $az $ic
+        ${RUNC_CMD} exec ${CENTRAL_PREFIX}${az} bash /data/create_ovn_res.sh $az no
     fi
 
 
@@ -1159,8 +1210,18 @@ case "${1:-""}" in
         stop
         ;;
     stop-chassis)
-        del-ovs-container-ports $2
-        stop-container $2
+        #del-ovs-container-ports $2
+        #stop-container $2
+	
+	chassis_name=$2
+        # 1. 기존 컨테이너 정리
+        del-ovs-container-ports "$chassis_name"
+        stop-container "$chassis_name"    
+
+	# 2. 리더 노드를 동적으로 찾아서 DB 삭제 명령 수행
+        SB_LEADER=$(get_sb_leader)
+        echo "Removing $chassis_name from Southbound DB (Leader: $SB_LEADER)..."
+        podman exec "$SB_LEADER" ovn-sbctl --if-exists chassis-del "$chassis_name"
         ;;
     build)
         check-for-ovn-rpms
